@@ -37,7 +37,7 @@ class ArgsModel(object):
 
     @staticmethod
     def add_decision_algo_param(parser: argparse.ArgumentParser):
-        parser.add_argument("--M", type=float, default=5,
+        parser.add_argument("--M", type=float, default=5.0,
             help="slope parameter.")
         parser.add_argument("--thres_type", type=str, default="all_defector",
             help="type of distribution for agents' thresholds. \
@@ -46,7 +46,7 @@ class ArgsModel(object):
         parser.add_argument("--net_group", type=str, default="parallel",
             help="the size of reference group. parallel, strong, weak, or serial.")
         parser.add_argument("--R_type", type=str, default="normal",
-            help="type of distribution for resources. normal, or lognormal.")
+            help="type of distribution for resources. equal, normal, or lognormal.")
         parser.add_argument("--div", type=str2bool, nargs="?", const=True, default=False,
             help="divisible contribution for agents if set.")
         return parser
@@ -78,11 +78,11 @@ class ArgsModel(object):
     def add_exp_param(parser: argparse.ArgumentParser):
         parser.add_argument("--N", type=int, default=100,
             help="# of agent.")
-        parser.add_argument("--n_iter", type=int, default=50,
+        parser.add_argument("--n_iter", type=int, default=200,
             help="# of iterations.")
         parser.add_argument("--figNo", type=int, default=1,
             help="the figure to replicate. 0 for custom parameters.")
-        parser.add_argument("--seed", type=int, default=1025,
+        parser.add_argument("--seed", type=int, default=10455,
             help="random seed.")
         return parser
 
@@ -91,8 +91,8 @@ class ArgsModel(object):
         """ set essential parameters for each experiments """
         args.figNo = figNo
         if figNo == 1:
-            args.N = 100
-            args.thres_type = "all_defector"
+            args.N = 1000
+            args.thres_type = "uni"
             args.div = False
             args.X = 0.
             args.J = 0.5
@@ -106,7 +106,7 @@ class ArgsModel(object):
             args2 = args
             args1.net_group = "parallel"
             args2.net_group = "serial"
-            return {"Serial Choice": args1, "Parallel Choice": args2}
+            return {"Parallel Choice": args1, "Serial Choice": args2}
 
 
     def get_args(self) -> dict:
@@ -148,11 +148,15 @@ class Agent(object):
     def set_param(self, thres, R, I, E):
         self.thres, self.R, self.I, self.E = thres, R, I, E
     
-    def to_volunteer(self, pi):
+    def to_volunteer(self, pi) -> None:
         #print("agent {} | pi = {:4f}".format(("  "+str(self.id))[-3:], pi))
-        p = 1/(1+math.exp(self.M * (self.thres - pi)))
-        self.is_volunteer = self.draw(p)
-        return self.is_volunteer
+        if self.thres == 1 and pi == 0:
+            self.is_volunteer = False
+        elif self.thres == 0 and pi == 1:
+            self.is_volunteer = True
+        else:
+            p = 1/(1+math.exp(self.M * (self.thres - pi)))
+            self.is_volunteer = self.draw(p)
     
     def get_net_pi(self):
         if self.net is None:
@@ -177,7 +181,8 @@ class PublicGoodsGame(object):
 
         self.R_ratio_list = list()
         self.R_ratio_list.append(self.global_R_ratio)
-    
+
+        self.L = 0
     
     @staticmethod
     def get_thres(thres_type: str, mean=0.5, sd=0.1):
@@ -199,8 +204,11 @@ class PublicGoodsGame(object):
                 return float(x1), float(x1)
             elif corr_RI == "neg":
                 return float(x1), -float(x1)
+        elif R_type == "equal" and I_type == "normal":
+            x1 = get_truncated_normal(mean=mean, sd=sd, low=0, upp=np.inf).rvs()
+            return 1., float(x1)
         else:
-            raise TypeError("haven't code dis. other than normal.")
+            raise TypeError("haven't coded distributions other than normal.")
     
     @staticmethod
     def get_E(E_type, mean=0.5, sd=0.1):
@@ -235,8 +243,9 @@ class PublicGoodsGame(object):
         return sum([ag.R for ag in self.ags if ag.is_volunteer]) / self.total_R
     
     def get_ag_pi(self, ag:Agent):
+        # paper: pi is "the participation rate"
         if self.args.net_group == "parallel":
-            return 1. if ag.is_volunteer else 0.
+            return 0.5
         elif self.args.net_group == "serial":
             return self.global_pi
         elif self.args.net_group in {"strong", "weak"}:
@@ -249,38 +258,56 @@ class PublicGoodsGame(object):
         3. calculate L; and find S_ij and O_ij for every agent j
         4. update T_ij for every agent j
         """
+        # 1.
         for ag in self.ags:
             ag.to_volunteer(pi=self.get_ag_pi(ag))
+        
+        # 2.
         self.global_pi = self._get_global_pi()
         self.global_R_ratio = self._get_global_R_ratio()
-        L = 1/(1+math.exp(10*(0.5-self.global_R_ratio))) - (1-self.args.X)/2
+
+        # 3.
+        # paper: pi is "the rate of contribution"
+        self.L = 1/(1+math.exp(10*(0.5-self.global_R_ratio))) - (1-self.args.X)/2
         S_max = -np.inf
         for ag in self.ags:
-            S_ij = L * self.args.N**(self.args.J) * ag.I - int(ag.is_volunteer)*ag.R
+            S_ij = self.L*self.total_R*ag.I/(self.total_R**(1-self.args.J)) - int(ag.is_volunteer)*ag.R
             O_ij = ag.E * (2*S_ij - ag.S)
             S_max = max(S_max, abs(S_ij))
             ag.S = S_ij
             ag.O = O_ij
+        
+        # 4.
         for ag in self.ags:
             ag.O = ag.O / (3*S_max)
             ag.O += epsilon
+            
+            t_drop = ag.O * (1 - (1-ag.thres)**(1/abs(ag.O)))
+            t_increase = ag.O * (1 - ag.thres**(1/abs(ag.O)))
+            t_drop = 0 if np.isnan(t_drop) else t_drop
+            t_increase = 0 if np.isnan(t_increase) else t_increase
+
             # threshold drops
             if ag.is_volunteer and ag.O>0:
-                ag.thres -= ag.O * (1 - (1-ag.thres)**(1/abs(ag.O)))
+                ag.thres -= t_drop
             elif not ag.is_volunteer and ag.O<0:
-                ag.thres += ag.O * (1 - (1-ag.thres)**(1/abs(ag.O)))
+                ag.thres += t_drop
             # threshold increases
             elif ag.is_volunteer and ag.O<0:
-                ag.thres -= ag.O * (1 - ag.thres**(1/abs(ag.O)))
+                ag.thres -= t_increase
             elif not ag.is_volunteer and ag.O>0:
-                ag.thres += ag.O * (1 - ag.thres**(1/abs(ag.O)))
+                ag.thres += t_increase
+            
+            ag.thres = min(ag.thres, 1.)
+            ag.thres = max(ag.thres, 0.)
 
     def simulate(self, log_v=1):
+        print("| iter   0 | pi = {:.4f}; R = {:.4f}; L = {:.4f}".format(self.global_pi, self.global_R_ratio, self.L))
         for iter in range(1, self.args.n_iter+1):
             self.simulate_iter()
             self.R_ratio_list.append(self.global_R_ratio) # pi: the rate of contribution
             if iter % log_v == 0:
-                print("| iter {} | pi = {:.4f}".format(("  "+str(iter))[-3:], self.global_pi))
+                print("| iter {} | pi = {:.4f}; R = {:.4f}; L = {:.4f}".format(("  "+str(iter))[-3:], self.global_pi, self.global_R_ratio, self.L))
     
     def get_pi_list(self):
         return np.array(self.R_ratio_list)
@@ -307,13 +334,13 @@ class PlotLinesHandler(object):
         self.legend_list.append(legend)
         plt.plot(np.arange(data.shape[-1]), data, linewidth=linewidth)
 
-    def save_fig(self):
+    def save_fig(self, title_param=""):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         
         plt.legend(self.legend_list)
         title_lg = "_".join(self.legend_list)
-        fn = "_".join([self.title, title_lg]) + ".png"
+        fn = "_".join([self.title, title_lg, title_param]) + ".png"
         plt.savefig(os.path.join(self.output_dir, fn))
         print("fig save to {}".format(os.path.join(self.output_dir, fn)))
 
@@ -332,4 +359,5 @@ if __name__ == "__main__":
         game = PublicGoodsGame(exp_args)
         game.simulate()
         plot_line_hd.plot_line(game.get_pi_list(), exp_legend)
-    plot_line_hd.save_fig()
+        param = "N_{}_T_{}".format(exp_args.N, exp_args.thres_type)
+    plot_line_hd.save_fig(param)
