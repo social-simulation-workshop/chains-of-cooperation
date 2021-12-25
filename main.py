@@ -1,6 +1,5 @@
 import argparse
 import csv
-import copy
 import itertools
 import os
 import math
@@ -9,117 +8,12 @@ import multiprocessing
 import numpy as np
 from scipy.stats import truncnorm
 
+from args import ArgsModel
+
+
 def get_truncated_normal(mean=0, sd=1, low=0, upp=10):
     return truncnorm(
         (low - mean) / sd, (upp - mean) / sd, loc=mean, scale=sd)
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    elif v.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    else:
-        raise argparse.ArgumentTypeError("Boolean value expected.")
-
-
-class ArgsModel(object):
-    
-    def __init__(self) -> None:
-        super().__init__()
-    
-        self.parser = argparse.ArgumentParser()
-        self.parser = self.add_decision_algo_param(self.parser)
-        self.parser = self.add_production_algo_param(self.parser)
-        self.parser = self.add_learning_algo_param(self.parser)
-        self.parser = self.add_exp_param(self.parser)
-
-    @staticmethod
-    def add_decision_algo_param(parser: argparse.ArgumentParser):
-        parser.add_argument("--M", type=float, default=5.0,
-            help="slope parameter.")
-        parser.add_argument("--thres_type", type=str, default="all_defector",
-            help="type of distribution for agents' thresholds. \
-                \"all_defector\" for all set to 1. \
-                \"uni\" for uniformly or \"nor\" for normally distributed.")
-        parser.add_argument("--net_group", type=str, default="parallel",
-            help="the size of reference group. parallel, strong, weak, or serial.")
-        parser.add_argument("--R_type", type=str, default="normal",
-            help="type of distribution for resources. equal, normal, or lognormal.")
-        parser.add_argument("--div", type=str2bool, nargs="?", const=True, default=False,
-            help="divisible contribution for agents if set.")
-        return parser
-        
-    @staticmethod
-    def add_production_algo_param(parser: argparse.ArgumentParser):
-        parser.add_argument("--X", type=float, default=0.,
-            help="the const that determined the range of L. X \in \[-1, 1\]. \
-                X = -1 for -1 <= L <= 0; \
-                X = 1 for 0 <= L <= 1;")
-        parser.add_argument("--J", type=float, default=0.5,
-            help="jointness of supply. J \in \[0, 1\].")
-        
-        # distribution of I_j is not disccussed in the paper.
-        parser.add_argument("--I_type", type=str, default="normal",
-            help="normal distribution for agent's interest in public goods with mean=1.")
-        parser.add_argument("--corr_RI", type=str, default="orthogonal",
-            help="correlation between the distribution of resource and interests. \
-                pos for r_RI = 1; neg for r_RI=1; orthogonal for independent dis.")
-        return parser
-    
-    @staticmethod
-    def add_learning_algo_param(parser: argparse.ArgumentParser):
-        parser.add_argument("--E_type", type=str, default="normal",
-            help="normal distribution for agent's learning rate parameter.")
-        return parser
-
-    @staticmethod
-    def add_exp_param(parser: argparse.ArgumentParser):
-        parser.add_argument("--N", type=int, default=100,
-            help="# of agent.")
-        parser.add_argument("--n_iter", type=int, default=200,
-            help="# of iterations.")
-        parser.add_argument("--figNo", type=int, default=1,
-            help="the figure to replicate. 0 for custom parameters.")
-        parser.add_argument("--seed", type=int, default=10455,
-            help="random seed.")
-        return parser
-
-    @staticmethod
-    def set_fig_param(args, figNo) -> dict:
-        """ set essential parameters for each experiments """
-        args.figNo = figNo
-        if figNo == 1:
-            args.N = 1000
-            args.thres_type = "uni"
-            args.div = False
-            args.X = 0.
-            args.J = 0.5
-
-            args.R_type = "normal"
-            args.I_type = "normal"
-            args.E_type = "normal"
-            args.corr_RI = "orthogonal"
-
-            args1 = copy.deepcopy(args)
-            args2 = args
-            args1.net_group = "parallel"
-            args2.net_group = "serial"
-            return {"Parallel Choice": args1, "Serial Choice": args2}
-
-
-    def get_args(self) -> dict:
-        args = self.parser.parse_args()
-        if args.figNo == 0:
-            return {"custom": args}
-        else:
-            return self.set_fig_param(args, args.figNo)
-    
-    
-    def get_fig_args(self, figNo:int) -> dict:
-        args = self.parser.parse_args()
-        return self.set_fig_param(args, figNo)
 
 
 class Agent(object):
@@ -148,6 +42,11 @@ class Agent(object):
     def set_param(self, thres, R, I, E):
         self.thres, self.R, self.I, self.E = thres, R, I, E
     
+    def add_net_member(self, ag):
+        if self.net is None:
+            self.net = list()
+        self.net.append(ag)
+    
     def to_volunteer(self, pi) -> None:
         #print("agent {} | pi = {:4f}".format(("  "+str(self.id))[-3:], pi))
         if self.thres == 1 and pi == 0:
@@ -166,12 +65,14 @@ class Agent(object):
 
 class PublicGoodsGame(object):
 
-    def __init__(self, args: argparse.ArgumentParser) -> None:
+    def __init__(self, args: argparse.ArgumentParser, verbose=True) -> None:
         super().__init__()
         Agent._ids = itertools.count(0)
-
+        
+        self.verbose = verbose
         self.args = args
-        print("Args: {}".format(args))
+        if self.verbose:
+            print("Args: {}".format(args))
 
         self.ags = self.init_ags(args)
         self.global_pi = self._get_global_pi()
@@ -188,9 +89,9 @@ class PublicGoodsGame(object):
     def get_thres(thres_type: str, mean=0.5, sd=0.1):
         if thres_type == "all_defector":
             return 1.
-        elif thres_type == "uni":
+        elif thres_type == "uniform":
             return np.random.uniform()
-        elif thres_type == "nor":
+        elif thres_type == "normal":
             return get_truncated_normal(mean=mean, sd=sd, low=0, upp=1).rvs()
 
     @staticmethod
@@ -223,9 +124,34 @@ class PublicGoodsGame(object):
         print("R: mean={:5f}; sd={:5f}".format(np.mean(R), np.std(R)))
         print("I: mean={:5f}; sd={:5f}".format(np.mean(I), np.std(I)))
         print("E: mean={:5f}; sd={:5f}".format(np.mean(E), np.std(E)))
+    
+    @staticmethod
+    def get_group_dis_n(n_ag, n_group=21, low=3, high=6) -> list:
+        group_dis_n = [low] * n_group
+        n_ag_ctr = low * n_group
+        while n_ag_ctr < n_ag:
+            chosen_gp = np.random.randint(n_group)
+            if group_dis_n[chosen_gp] < high:
+                group_dis_n[chosen_gp] += 1
+                n_ag_ctr += 1
+        assert(sum(group_dis_n) == n_ag)
+        return group_dis_n
+    
+    @staticmethod
+    def get_randint(low, high, exclude, size:int) -> list:
+        ctr = 0
+        ans = list()
+        while ctr < size:
+            chosen_ag = np.random.randint(low, high)
+            if chosen_ag != exclude:
+                ans.append(chosen_ag)
+                ctr += 1
+        return ans
 
     def init_ags(self, args: argparse.ArgumentParser) -> list:
         ags = list()
+
+        # built agents
         for _ in range(args.N):
             ag = Agent(args)
             thres = self.get_thres(args.thres_type)
@@ -233,7 +159,22 @@ class PublicGoodsGame(object):
             E = self.get_E(args.E_type)
             ag.set_param(thres, R, I, E)
             ags.append(ag)
-        self.check_distribution(ags)
+        if self.verbose:
+            self.check_distribution(ags)
+
+        # build network (undirected graph)
+        if args.net_group == "strong":
+            n_ag_ctr = 0
+            for n_ag_gp in self.get_group_dis_n(args.N):
+                for i in range(n_ag_ctr, n_ag_ctr+n_ag_gp):
+                    for j in range(i+1, n_ag_ctr+n_ag_gp):
+                        ags[i].add_net_member(ags[j])
+                        ags[j].add_net_member(ags[i])
+                n_ag_ctr += n_ag_gp
+        if args.net_group == "weak":
+            for ag_ctr, ag in enumerate(ags):
+                for chosen_ag in self.get_randint(0, args.N, ag_ctr, size=3):
+                    ag.add_net_member(ags[chosen_ag])
         return ags   
 
     def _get_global_pi(self):
@@ -301,12 +242,13 @@ class PublicGoodsGame(object):
             ag.thres = min(ag.thres, 1.)
             ag.thres = max(ag.thres, 0.)
 
-    def simulate(self, log_v=1):
-        print("| iter   0 | pi = {:.4f}; R = {:.4f}; L = {:.4f}".format(self.global_pi, self.global_R_ratio, self.L))
+    def simulate(self, log_v=50):
+        if self.verbose:
+            print("| iter   0 | pi = {:.4f}; R = {:.4f}; L = {:.4f}".format(self.global_pi, self.global_R_ratio, self.L))
         for iter in range(1, self.args.n_iter+1):
             self.simulate_iter()
             self.R_ratio_list.append(self.global_R_ratio) # pi: the rate of contribution
-            if iter % log_v == 0:
+            if self.verbose and iter % log_v == 0:
                 print("| iter {} | pi = {:.4f}; R = {:.4f}; L = {:.4f}".format(("  "+str(iter))[-3:], self.global_pi, self.global_R_ratio, self.L))
     
     def get_pi_list(self):
@@ -330,34 +272,70 @@ class PlotLinesHandler(object):
         ax = plt.gca()
         ax.set_ylim([0., 1.])
 
-    def plot_line(self, data, legend, linewidth=1):
+    def plot_line(self, data, legend,
+        linewidth=1, color="", alpha=1.0):
         self.legend_list.append(legend)
-        plt.plot(np.arange(data.shape[-1]), data, linewidth=linewidth)
+        if color:
+            plt.plot(np.arange(data.shape[-1]), data,
+                linewidth=linewidth, color=color, alpha=alpha)
+        else:
+            plt.plot(np.arange(data.shape[-1]), data, linewidth=linewidth)
 
-    def save_fig(self, title_param=""):
+    def save_fig(self, title_param="", add_legend=True, title_lg=""):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         
-        plt.legend(self.legend_list)
-        title_lg = "_".join(self.legend_list)
+        if add_legend:
+            plt.legend(self.legend_list)
+            title_lg = "_".join(self.legend_list)
         fn = "_".join([self.title, title_lg, title_param]) + ".png"
+            
         plt.savefig(os.path.join(self.output_dir, fn))
         print("fig save to {}".format(os.path.join(self.output_dir, fn)))
 
 
-
+N_RANDOM_TRAILS = 30
+COLORS = ["red", "blue"]
 
 if __name__ == "__main__":
     parser = ArgsModel()
     
-    ## figure 1
-    args_dict = parser.get_fig_args(1)
+    ## multiple trails on one condition
+    custom_legend = "Pos vs. Neg"
+    args_dict = parser.get_fig_args(5)
     plot_line_hd = PlotLinesHandler(xlabel="Iteration", ylabel="pi",
                                     ylabel_show="Level of Contribution "+r"$\pi$")
-    for exp_legend, exp_args in args_dict.items():
-        np.random.seed(seed=exp_args.seed)
-        game = PublicGoodsGame(exp_args)
-        game.simulate()
-        plot_line_hd.plot_line(game.get_pi_list(), exp_legend)
-        param = "N_{}_T_{}".format(exp_args.N, exp_args.thres_type)
-    plot_line_hd.save_fig(param)
+    for n_trail in range(N_RANDOM_TRAILS):
+        for args_ctr, (exp_legend, exp_args) in enumerate(args_dict.items()):
+            print("| trail {}/{} |".format(n_trail+1, N_RANDOM_TRAILS))
+            np.random.seed(seed=exp_args.seed+n_trail)
+            game = PublicGoodsGame(exp_args, verbose=False)
+            game.simulate()
+            plot_line_hd.plot_line(game.get_pi_list(), "",
+                color=COLORS[args_ctr], alpha=0.15)
+            param = "N_{}_T_{}_ntrails_{}".format(exp_args.N, exp_args.thres_type, N_RANDOM_TRAILS)
+    plot_line_hd.save_fig(param, add_legend=False, title_lg=custom_legend)
+
+    # ## figure 1
+    # args_dict = parser.get_fig_args(1)
+    # plot_line_hd = PlotLinesHandler(xlabel="Iteration", ylabel="pi",
+    #                                 ylabel_show="Level of Contribution "+r"$\pi$")
+    # for exp_legend, exp_args in args_dict.items():
+    #     np.random.seed(seed=exp_args.seed)
+    #     game = PublicGoodsGame(exp_args)
+    #     game.simulate()
+    #     plot_line_hd.plot_line(game.get_pi_list(), exp_legend)
+    #     param = "N_{}_T_{}".format(exp_args.N, exp_args.thres_type)
+    # plot_line_hd.save_fig(param)
+
+    # ## figure 2
+    # args_dict = parser.get_fig_args(2)
+    # plot_line_hd = PlotLinesHandler(xlabel="Iteration", ylabel="pi",
+    #                                 ylabel_show="Level of Contribution "+r"$\pi$")
+    # for exp_legend, exp_args in args_dict.items():
+    #     np.random.seed(seed=exp_args.seed)
+    #     game = PublicGoodsGame(exp_args)
+    #     game.simulate()
+    #     plot_line_hd.plot_line(game.get_pi_list(), exp_legend)
+    #     param = "N_{}_T_{}".format(exp_args.N, exp_args.thres_type)
+    # plot_line_hd.save_fig(param)
